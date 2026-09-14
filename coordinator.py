@@ -1,15 +1,18 @@
 """
-E-Commerce Catalog Pipeline Coordinator
-Orchestrates the end-to-end monitoring lifecycle:
-Ingestion (Shopify) -> Schema Validation -> Delta Analysis -> Alert Dispatching
+Pipeline Coordinator
+Runs: Scrape → Validate → Delta → Alert
+Ensures atomic execution, rigid failure stops, and audit telemetry.
 """
 
 import argparse
+import csv
 import logging
+import sqlite3
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-import pandas as pd
-import requests
 
 logging.basicConfig(
     level=logging.INFO,
@@ -18,112 +21,189 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PipelineCoordinator")
 
+# Base directory anchor for deterministic sibling path resolution
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 class PipelineCoordinator:
-    def __init__(self, data_dir: str = "pipeline_data"):
-        self.data_dir = Path(data_dir)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.baseline_file = self.data_dir / "baseline_catalog.csv"
-        self.current_file = self.data_dir / "current_catalog.csv"
-        self.delta_file = self.data_dir / "deltas.csv"
+    def __init__(self, db_path: str = "orchestration_audit.db"):
+        self.db_path = Path(db_path).resolve()
+        self.conn = sqlite3.connect(self.db_path)
+        self._init_audit_schema()
 
-    def execute(self, store_url: str, pages: int = 1) -> bool:
-        logger.info(f"--- INITIATING MONITORING CYCLE: {store_url} ---")
+    def _init_audit_schema(self):
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS pipeline_runs (
+                    run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pipeline_name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    extracted_records INTEGER DEFAULT 0,
+                    anomalies_detected INTEGER DEFAULT 0,
+                    execution_time_sec REAL NOT NULL,
+                    executed_at TEXT NOT NULL,
+                    notes TEXT
+                )
+            """)
 
-        # Step 1: Real Extraction
-        logger.info("Step 1: Extracting storefront catalog...")
-        endpoint = f"{store_url.rstrip('/')}/products.json?limit=250&page=1"
+    def _run_command(self, command: list, step_name: str) -> tuple[bool, str]:
+        """Run an external process with timeout and strict error capture."""
+        logger.info(f"Executing step: {step_name}")
         try:
-            res = requests.get(endpoint, headers={"User-Agent": "CatalogSentinel/1.0"}, timeout=15)
-            res.raise_for_status()
-            products = res.json().get("products", [])
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False
+            )
+            if result.returncode == 0:
+                logger.info(f"✓ {step_name} completed successfully")
+                return True, result.stdout
+            
+            logger.error(f"✗ {step_name} exited with code {result.returncode}\nStderr: {result.stderr.strip()}")
+            return False, result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            msg = f"{step_name} timed out after 300 seconds"
+            logger.error(f"✗ {msg}")
+            return False, msg
         except Exception as e:
-            logger.critical(f"Failed to fetch storefront feed: {e}")
-            return False
+            logger.error(f"✗ {step_name} runtime exception: {e}")
+            return False, str(e)
 
-        records = []
-        for p in products:
-            title = p.get("title", "")
-            for v in p.get("variants", []):
-                records.append({
-                    "variant_id": v.get("id"),
-                    "title": f"{title} - {v.get('title', '')}".strip(" -"),
-                    "sku": v.get("sku") or f"SKU-{v.get('id')}",
-                    "price": float(v.get("price", 0.0)),
-                    "available": bool(v.get("available", False))
-                })
+    def _count_csv_records(self, csv_path: str | Path) -> int:
+        """Fast, dependency-free row counter (excluding header)."""
+        p = Path(csv_path)
+        if not p.exists() or p.stat().st_size == 0:
+            return 0
+        try:
+            with open(p, mode="r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                if not header:
+                    return 0
+                return sum(1 for _ in reader)
+        except Exception as e:
+            logger.warning(f"Could not count records in {csv_path}: {e}")
+            return 0
 
-        df_current = pd.DataFrame(records)
-        if df_current.empty:
-            logger.critical("Extraction yielded 0 items.")
-            return False
+    def execute_lifecycle(
+        self,
+        baseline_csv: str,
+        current_csv: str,
+        delta_output: str = "delta_results.csv"
+    ) -> bool:
+        start_time = time.time()
+        run_timestamp = datetime.now(timezone.utc).isoformat()
+        notes = []
+        anomalies = 0
+        status = "FAILED"
+        extracted_records = self._count_csv_records(current_csv)
 
-        df_current.to_csv(self.current_file, index=False)
-        logger.info(f"Step 1 Complete: Ingested {len(df_current)} variants.")
+        logger.info("=== Starting Orchestration Lifecycle ===")
 
-        # Step 2: Schema Hygiene Validation
-        logger.info("Step 2: Validating schema hygiene...")
-        duplicate_count = int(df_current["variant_id"].duplicated().sum())
-        null_count = int(df_current[["variant_id", "price", "available"]].isnull().sum().sum())
-        
-        if duplicate_count > 0 or null_count > 0:
-            logger.critical(f"Data quality assertion failure: {duplicate_count} duplicates, {null_count} nulls.")
-            return False
-        logger.info("Step 2 Complete: Hygiene Score 100% (Passed).")
+        # Resolve sibling module paths dynamically
+        validator_script = BASE_DIR / "catalog-validation-sentinel" / "schema_validator.py"
+        delta_script = BASE_DIR / "ecommerce-delta-engine" / "delta_engine.py"
+        alert_script = BASE_DIR / "ecom-telemetry-alerts" / "alert_dispatcher.py"
 
-        # Step 3: Delta Computing
-        logger.info("Step 3: Calculating relational deltas...")
-        if not self.baseline_file.exists():
-            logger.info("No prior baseline detected. Initializing current catalog as baseline.")
-            df_current.to_csv(self.baseline_file, index=False)
-            logger.info("Monitoring baseline established.")
+        try:
+            # Step 1: Validate Schema & Types
+            val_success, val_output = self._run_command(
+                [
+                    sys.executable, str(validator_script),
+                    "--input", current_csv,
+                    "--output", "validation_report.json"
+                ],
+                "Schema Validation"
+            )
+            if not val_success:
+                notes.append("Validation failed; lifecycle halted to prevent dirty delta.")
+                logger.error("Halting pipeline: Current snapshot failed validation checks.")
+                return False
+
+            # Step 2: Compute Deltas (Only reached if validation passes)
+            delta_success, delta_output_log = self._run_command(
+                [
+                    sys.executable, str(delta_script),
+                    "--baseline", baseline_csv,
+                    "--current", current_csv,
+                    "--output", delta_output
+                ],
+                "Delta Engine"
+            )
+            if not delta_success:
+                notes.append("Delta engine computation failed.")
+                return False
+
+            anomalies = self._count_csv_records(delta_output)
+
+            # Step 3: Alerts (Only triggered if actionable anomalies exist)
+            if anomalies > 0:
+                logger.info(f"Detected {anomalies} anomaly records. Triggering alerts...")
+                alert_success, alert_log = self._run_command(
+                    [
+                        sys.executable, str(alert_script),
+                        "--deltas", str(delta_output),
+                        "--send"
+                    ],
+                    "Alert Dispatcher"
+                )
+                if not alert_success:
+                    notes.append("Alert dispatch failed.")
+            else:
+                logger.info("No delta anomalies detected. Skipping alert dispatch.")
+
+            status = "SUCCESS"
             return True
 
-        df_baseline = pd.read_csv(self.baseline_file)
-        merged = pd.merge(
-            df_baseline,
-            df_current,
-            on="variant_id",
-            how="outer",
-            suffixes=("_prev", "_curr")
-        )
+        except Exception as err:
+            notes.append(f"Fatal orchestration error: {str(err)}")
+            logger.critical(f"Orchestration crashed: {err}")
+            return False
 
-        deltas = []
-        for _, row in merged.iterrows():
-            vid = row["variant_id"]
-            if pd.isna(row["price_prev"]):
-                deltas.append({"variant_id": vid, "event_type": "PRODUCT_ADDED", "title": row["title_curr"], "detail": f"Added at ${row['price_curr']}"})
-            elif pd.isna(row["price_curr"]):
-                deltas.append({"variant_id": vid, "event_type": "PRODUCT_REMOVED", "title": row["title_prev"], "detail": "Delisted"})
-            elif float(row["price_prev"]) != float(row["price_curr"]):
-                deltas.append({"variant_id": vid, "event_type": "PRICE_CHANGE", "title": row["title_curr"], "detail": f"${row['price_prev']} -> ${row['price_curr']}"})
-            elif bool(row["available_prev"]) != bool(row["available_curr"]):
-                deltas.append({"variant_id": vid, "event_type": "STOCKOUT" if not row["available_curr"] else "RESTOCK", "title": row["title_curr"], "detail": "Stock state shift"})
+        finally:
+            elapsed = round(time.time() - start_time, 3)
+            with self.conn:
+                self.conn.execute("""
+                    INSERT INTO pipeline_runs 
+                    (pipeline_name, status, extracted_records, anomalies_detected, 
+                     execution_time_sec, executed_at, notes)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    "ecom_monitor",
+                    status,
+                    extracted_records,
+                    anomalies,
+                    elapsed,
+                    run_timestamp,
+                    "; ".join(notes) if notes else None
+                ))
+            logger.info(f"=== Run Complete | Status: {status} | Duration: {elapsed}s | Anomalies: {anomalies} ===")
 
-        df_deltas = pd.DataFrame(deltas)
-        df_deltas.to_csv(self.delta_file, index=False)
-        logger.info(f"Step 3 Complete: Identified {len(df_deltas)} delta events.")
-
-        # Step 4: Alert Dispatching
-        if not df_deltas.empty:
-            logger.info(f"Step 4: Formatted telemetry payload for {len(df_deltas)} events.")
-        else:
-            logger.info("Step 4: Zero deltas detected across catalog snapshots.")
-
-        # Update baseline
-        df_current.to_csv(self.baseline_file, index=False)
-        logger.info("Cycle finished cleanly. Baseline updated.")
-        return True
+    def close(self):
+        if self.conn:
+            self.conn.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="End-to-end catalog monitoring coordinator.")
-    parser.add_argument("--url", "-u", required=True, help="Target Shopify storefront URL")
+    parser = argparse.ArgumentParser(description="Run the e-commerce monitoring pipeline coordinator")
+    parser.add_argument("--baseline", required=True, help="Path to previous baseline CSV snapshot")
+    parser.add_argument("--current", required=True, help="Path to current run CSV snapshot")
+    parser.add_argument("--output", default="delta_results.csv", help="Destination path for delta results")
+    parser.add_argument("--db", default="orchestration_audit.db", help="Audit SQLite database path")
     args = parser.parse_args()
 
-    coordinator = PipelineCoordinator()
-    success = coordinator.execute(store_url=args.url)
-    sys.exit(0 if success else 1)
+    coordinator = PipelineCoordinator(db_path=args.db)
+    try:
+        success = coordinator.execute_lifecycle(
+            baseline_csv=args.baseline,
+            current_csv=args.current,
+            delta_output=args.output
+        )
+        sys.exit(0 if success else 1)
+    finally:
+        coordinator.close()
 
 
 if __name__ == "__main__":
