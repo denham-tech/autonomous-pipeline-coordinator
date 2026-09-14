@@ -1,12 +1,15 @@
-# Autonomous E-Commerce Pipeline Coordinator
+# Autonomous Pipeline Coordinator
 
-Production orchestration engine engineered in **Python** and **SQLite** to manage the end-to-end data lifecycle for dynamic retail intelligence feeds. Coordinates extraction, snapshot delta calculations, and telemetry dispatch with integrated runtime auditing.
+End-to-end execution orchestrator for e-commerce catalog monitoring. Automates the full sequential lifecycle: live Shopify extraction, tabular schema validation, relational delta computing, and telemetry event logging.
 
-## Core Capabilities
-- **Lifecycle Orchestration:** Coordinates asynchronous crawl jobs, Pandas-driven snapshot diffing, and webhook notifications sequentially.
-- **Fault-Tolerant Execution:** Encapsulates pipeline steps in structured exception handling to ensure uninterrupted data delivery.
-- **Operational Auditing:** Automatically logs execution latency, extraction record counts, and anomaly counts into a persistent SQLite runtime database.
+## Workflow
+1. **Catalog Ingestion:** Extracts live product variants directly from storefront endpoints.
+2. **Schema Hygiene Gate:** Validates primary keys, checks null rates, and enforces relational integrity.
+3. **State Diffing:** Performs outer merges against baseline snapshots to isolate price adjustments, stockouts, and SKU changes.
+4. **Telemetry Logging:** Prepares structured event payloads for alerting channels.
 
-## Architecture
-- `coordinator.py` - Master orchestration and lifecycle controller.
-- `orchestration_audit.db` - Persistent audit warehouse tracking pipeline reliability and performance metrics (untracked).
+## Usage
+
+```bash
+# Execute monitoring cycle against a live storefront
+python coordinator.py --url [https://colourpop.com](https://colourpop.com)
